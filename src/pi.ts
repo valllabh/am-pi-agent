@@ -1,16 +1,19 @@
 // Runtime adapter for `pi` (npm @mariozechner/pi-coding-agent). Pattern
-// borrowed from web-exposure-detection/src/pkg/webexposure/ai/pi/pi.go which
-// has been running this exact shape in production against Bedrock Nova.
+// borrowed from web-exposure-detection/src/pkg/webexposure/ai/pi/pi.go.
 //
 // pi takes a system prompt + a user message + a provider/model and emits an
 // NDJSON event stream on stdout. The agent inside runs a tool-use loop with
-// bash + write + read built in. For Bedrock we authenticate via the ECS task
-// role; no api key is needed.
+// bash + write + read built in. Bedrock auth comes from the ECS task role.
+//
+// runPi returns the result and lets the caller (runner.ts) drive
+// `complete`/`fail` so the monitor can upload artifacts in between.
 
 import { spawn } from "node:child_process";
 import { mkdirSync, readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
-import type { BootstrapResponse, ManagerClient } from "./sdk.js";
+
+import type { Monitor } from "./sdk/src/monitor.js";
+import type { BootstrapResponse, ManagerClient } from "./sdk/src/sdk.js";
 
 export interface RunPiArgs {
   client: ManagerClient;
@@ -18,13 +21,13 @@ export interface RunPiArgs {
   prompt: string;
   payload: Record<string, unknown>;
   workdir?: string;
+  monitor?: Monitor;
 }
 
-interface LogEvent {
-  ts: string;
-  level: string;
-  message: string;
-  [k: string]: unknown;
+export interface RunPiResult {
+  result?: Record<string, unknown>;
+  error?: { code: string; message: string; detail?: Record<string, unknown> };
+  tokens: { in: number; out: number; costUsd: number };
 }
 
 interface PiUsage {
@@ -35,8 +38,6 @@ interface PiUsage {
   costUsd?: number;
 }
 
-// Strip the `amazon-bedrock/` prefix off our internal model id when handing it
-// to pi (pi's --provider already names the route; --model takes the bare id).
 function modelFor(piProvider: string, model: string): string {
   if (piProvider === "amazon-bedrock") {
     const idx = model.indexOf("/");
@@ -53,8 +54,8 @@ function piProviderFor(model: string): string | null {
   return model.slice(0, idx);
 }
 
-export async function runPi(args: RunPiArgs): Promise<void> {
-  const { client, bootstrap, prompt, payload } = args;
+export async function runPi(args: RunPiArgs): Promise<RunPiResult> {
+  const { client, bootstrap, prompt, payload, monitor } = args;
   const workdir = args.workdir ?? "/work";
 
   const requestedModel =
@@ -64,33 +65,28 @@ export async function runPi(args: RunPiArgs): Promise<void> {
 
   const piProvider = piProviderFor(requestedModel);
   if (!piProvider) {
-    await client.fail({
-      code: "agent.unknown_secret_key",
-      message: `model id missing provider prefix: ${requestedModel}`,
-    });
-    return;
+    return {
+      error: {
+        code: "agent.unknown_secret_key",
+        message: `model id missing provider prefix: ${requestedModel}`,
+      },
+      tokens: { in: 0, out: 0, costUsd: 0 },
+    };
   }
   const piModel = modelFor(piProvider, requestedModel);
 
   mkdirSync(workdir, { recursive: true });
 
-  // Bedrock auth: ECS task role on Fargate, AWS_* env locally. pi reads the
-  // SDK default chain; only AWS_REGION needs to be explicit so inference
-  // profiles like `us.amazon.nova-pro-v1:0` resolve.
   const env: NodeJS.ProcessEnv = { ...process.env };
   if (piProvider === "amazon-bedrock") {
-    env.AWS_REGION =
-      env.AWS_REGION ?? env.AWS_DEFAULT_REGION ?? "us-east-1";
+    env.AWS_REGION = env.AWS_REGION ?? env.AWS_DEFAULT_REGION ?? "us-east-1";
     env.AWS_DEFAULT_REGION = env.AWS_REGION;
   }
-
-  // Push everything sandbox secrets carry into the child env as well so the
-  // agent can `curl $GITHUB_TOKEN`, `$QUALYS_*`, etc directly.
   for (const [k, v] of Object.entries(bootstrap.secrets)) {
     env[k] = v;
   }
 
-  const queue: LogEvent[] = [];
+  const queue: Array<{ ts: string; level: string; message: string; [k: string]: unknown }> = [];
   let flushTimer: NodeJS.Timeout | null = null;
   let flushing: Promise<void> = Promise.resolve();
   const flush = async (): Promise<void> => {
@@ -102,8 +98,10 @@ export async function runPi(args: RunPiArgs): Promise<void> {
       /* don't fail run on log loss */
     }
   };
-  const enqueue = (e: LogEvent): void => {
+  const enqueue = (e: { ts: string; level: string; message: string; [k: string]: unknown }): void => {
     queue.push(e);
+    monitor?.appendTranscript(JSON.stringify(e));
+    monitor?.markActivity();
     if (queue.length >= 50) {
       if (flushTimer) {
         clearTimeout(flushTimer);
@@ -136,12 +134,31 @@ export async function runPi(args: RunPiArgs): Promise<void> {
       piModel,
       "--system-prompt",
       prompt,
-      // Empty user message — the system prompt carries the full task because
-      // it is already assembled by the caller from soulMd + skill bodies.
       "go",
     ],
     { cwd: workdir, env },
   );
+
+  monitor?.markActivity();
+  enqueue({
+    ts: new Date().toISOString(),
+    level: "info",
+    message: "pi spawned",
+    provider: piProvider,
+    model: piModel,
+    pid: child.pid,
+  });
+
+  // Let the monitor kill us on stall by setting a hook that signals the child.
+  if (monitor) {
+    monitor.bindStallKill?.(() => {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        /* swallow */
+      }
+    });
+  }
 
   const stdoutRl = createInterface({ input: child.stdout });
   stdoutRl.on("line", (line: string) => {
@@ -156,7 +173,6 @@ export async function runPi(args: RunPiArgs): Promise<void> {
       parsed = null;
     }
     if (parsed) {
-      // Track tokens via message_end events.
       const msg = parsed.message as
         | { role?: string; content?: Array<{ type?: string; text?: string }>; usage?: PiUsage }
         | undefined;
@@ -196,25 +212,19 @@ export async function runPi(args: RunPiArgs): Promise<void> {
   await flushing;
   await flush();
 
+  const tokens = { in: totalIn, out: totalOut, costUsd: totalCostUsd };
+
   if (exitCode !== 0) {
-    await client.fail({
-      code: "provider.failed",
-      message: lastStderr || `pi exited with code ${exitCode}`,
-      detail: { exitCode },
-    });
-    return;
+    return {
+      error: {
+        code: "provider.failed",
+        message: lastStderr || `pi exited with code ${exitCode}`,
+        detail: { exitCode },
+      },
+      tokens,
+    };
   }
 
-  // Cost reporting goes through the manager's /v1/tasks/:id/cost route; the
-  // sdk surface that's wired in this build only exposes complete/fail/logs so
-  // cost is folded into the complete payload for now.
-  void totalIn;
-  void totalOut;
-  void totalCostUsd;
-
-  // Prefer the agent's output file if it wrote one (skills commit results to
-  // .am-out/result.json by convention); otherwise fall back to the last
-  // assistant text from the event stream.
   const outFile = `${workdir}/.am-out/result.json`;
   let result: Record<string, unknown> = { ok: true };
   try {
@@ -229,5 +239,5 @@ export async function runPi(args: RunPiArgs): Promise<void> {
     }
   }
 
-  await client.complete(result);
+  return { result, tokens };
 }
