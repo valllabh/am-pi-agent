@@ -1,7 +1,7 @@
 import { runPi } from "./pi.js";
 import { startMonitor } from "./sdk/src/monitor.js";
 import { ManagerClient } from "./sdk/src/sdk.js";
-import { buildSkillsContext } from "./sdk/src/skills.js";
+import { buildSkillsContext, stageSkillAssets } from "./sdk/src/skills.js";
 
 // Minimal NDJSON event helper that also routes the same line to the monitor's
 // transcript buffer. Lets us narrate every phase from bootstrap to closing
@@ -131,8 +131,10 @@ async function main(): Promise<void> {
       const skills = await client.loadSkills();
       logT("info", "runner: skills loaded", {
         count: skills.length,
-        skills: skills.map((s) => ({ name: s.name, version: s.version, bodyLen: s.body?.length ?? 0 })),
+        skills: skills.map((s) => ({ name: s.name, version: s.version, bodyLen: s.body?.length ?? 0, hasAssets: !!s.assetsRef })),
       });
+      const stagedCount = await stageSkillAssets({ client, skills, workdir, log: logT });
+      logT("info", "runner: skill assets staged", { count: stagedCount });
       const skillsContext = buildSkillsContext(skills);
       fullPrompt = `${bootstrap.soulMd}${skillsContext}\n\n# Task\n\n${prompt}`.trimStart();
       logT("info", "runner: prompt assembled", {
