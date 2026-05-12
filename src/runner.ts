@@ -8,7 +8,7 @@ import { buildSkillsContext } from "./sdk/src/skills.js";
 // rituals so the UI Live transcript Card shows what is happening even when
 // the LLM (pi child process) is silent.
 function makeLogger(
-  client: { pushLogs: (e: object[]) => Promise<void> },
+  client: ManagerClient,
   appendTranscript?: (line: string) => void,
 ): (level: string, message: string, extras?: Record<string, unknown>) => void {
   return (level, message, extras) => {
