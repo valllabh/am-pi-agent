@@ -3,7 +3,29 @@ import { startMonitor } from "./sdk/src/monitor.js";
 import { ManagerClient } from "./sdk/src/sdk.js";
 import { buildSkillsContext } from "./sdk/src/skills.js";
 
+// Minimal NDJSON event helper that also routes the same line to the monitor's
+// transcript buffer. Lets us narrate every phase from bootstrap to closing
+// rituals so the UI Live transcript Card shows what is happening even when
+// the LLM (pi child process) is silent.
+function makeLogger(
+  client: { pushLogs: (e: object[]) => Promise<void> },
+  appendTranscript?: (line: string) => void,
+): (level: string, message: string, extras?: Record<string, unknown>) => void {
+  return (level, message, extras) => {
+    const evt = { ts: new Date().toISOString(), level, message, ...(extras ?? {}) };
+    void client.pushLogs([evt]).catch(() => {});
+    try {
+      appendTranscript?.(JSON.stringify(evt));
+    } catch {
+      /* swallow */
+    }
+    // Also stderr so CloudWatch retains the same trace even if pushLogs fails.
+    console.error(JSON.stringify(evt));
+  };
+}
+
 async function main(): Promise<void> {
+  const t0 = Date.now();
   const TASK_ID = process.env.TASK_ID;
   const MANAGER_URL = process.env.MANAGER_URL;
   const BOOTSTRAP_TOKEN = process.env.BOOTSTRAP_TOKEN;
@@ -12,10 +34,26 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
+  // Phase 1: bootstrap. Pre-bootstrap we cannot pushLogs (no run JWT yet); log
+  // to stderr only so it still shows up in CloudWatch.
+  console.error(JSON.stringify({ ts: new Date().toISOString(), level: "info", message: "runner: bootstrap starting", taskId: TASK_ID }));
+
   const { client, bootstrap } = await ManagerClient.bootstrap({
     TASK_ID,
     MANAGER_URL,
     BOOTSTRAP_TOKEN,
+  });
+
+  const log = makeLogger(client);
+  log("info", "runner: bootstrap complete", {
+    runId: bootstrap.runId,
+    agentName: bootstrap.agent.name,
+    agentVersion: bootstrap.agent.version,
+    imageUri: bootstrap.agent.imageUri,
+    enabledSkills: bootstrap.enabledSkills,
+    secretKeys: Object.keys(bootstrap.secrets),
+    soulMdLen: bootstrap.soulMd.length,
+    elapsedMs: Date.now() - t0,
   });
 
   const payload = bootstrap.task.payload as Record<string, unknown>;
@@ -29,9 +67,13 @@ async function main(): Promise<void> {
     heartbeatMs: 30_000,
     stallMs: 180_000,
     onStall: (idleMs) => {
-      console.error(`[monitor] child stalled for ${idleMs}ms; killing`);
+      log("error", "runner: watchdog fired, child stalled", { idleMs });
     },
   });
+  log("info", "runner: monitor started", { heartbeatMs: 30_000, stallMs: 180_000 });
+  // Re-bind the logger to also append into the monitor transcript buffer so
+  // the finalize() artifact contains the same trace the UI streams live.
+  const logT = makeLogger(client, (line) => monitor.appendTranscript(line));
 
   let fullPrompt = "";
   let runResult: Record<string, unknown> | undefined;
@@ -40,9 +82,15 @@ async function main(): Promise<void> {
 
   monitor.bindStallKill(() => {
     stalled = true;
+    logT("warn", "runner: stall flag set");
   });
 
-  const finalize = async (): Promise<void> => {
+  const finalize = async (reason: string): Promise<void> => {
+    logT("info", "runner: finalize starting", {
+      reason,
+      hasResult: runResult !== undefined,
+      hasError: runError !== undefined,
+    });
     try {
       await monitor.finalize({
         systemPrompt: fullPrompt,
@@ -52,8 +100,9 @@ async function main(): Promise<void> {
           ? { error: { code: runError.code, message: runError.message } }
           : {}),
       });
-    } catch {
-      /* finalize is best effort */
+      logT("info", "runner: finalize complete (artifacts uploaded)");
+    } catch (e) {
+      logT("error", "runner: finalize failed", { err: (e as Error).message });
     }
   };
 
@@ -63,8 +112,9 @@ async function main(): Promise<void> {
       if (signalled) return;
       signalled = true;
       void (async () => {
+        logT("warn", `runner: received ${sig}`);
         runError = runError ?? { code: "internal.signal", message: `received ${sig}` };
-        await finalize();
+        await finalize(sig);
         try {
           await client.fail({ code: runError.code, message: runError.message });
         } catch {
@@ -77,9 +127,23 @@ async function main(): Promise<void> {
 
   try {
     if (typeof prompt === "string" && prompt.length > 0) {
+      logT("info", "runner: loading skills");
       const skills = await client.loadSkills();
+      logT("info", "runner: skills loaded", {
+        count: skills.length,
+        skills: skills.map((s) => ({ name: s.name, version: s.version, bodyLen: s.body?.length ?? 0 })),
+      });
       const skillsContext = buildSkillsContext(skills);
       fullPrompt = `${bootstrap.soulMd}${skillsContext}\n\n# Task\n\n${prompt}`.trimStart();
+      logT("info", "runner: prompt assembled", {
+        chars: fullPrompt.length,
+        skillsContextChars: skillsContext.length,
+        userPromptChars: typeof prompt === "string" ? prompt.length : 0,
+      });
+      logT("info", "runner: dispatching to pi runtime", {
+        model: typeof payload.model === "string" ? payload.model : "(default)",
+      });
+
       const out = await runPi({
         client,
         bootstrap,
@@ -87,43 +151,53 @@ async function main(): Promise<void> {
         payload,
         workdir,
         monitor,
+        log: logT,
+      });
+      logT("info", "runner: pi runtime returned", {
+        hasResult: !!out.result,
+        hasError: !!out.error,
+        tokens: out.tokens,
       });
       if (stalled) {
         runError = {
           code: "agent.stalled",
           message: "child produced no output within stall window; killed by watchdog",
         };
+        logT("error", "runner: marking task as stalled");
       } else if (out.error) {
         runError = out.error;
       } else {
         runResult = out.result ?? { ok: true };
       }
     } else {
+      logT("warn", "runner: no prompt in payload; nothing to do");
       runResult = { ok: true, echo: payload };
     }
   } catch (err) {
     const e = err as Error;
     runError = { code: "internal.error", message: e.message };
+    logT("error", "runner: caught exception", { err: e.message, stack: e.stack?.slice(0, 1000) });
   }
 
-  // Order: stop timers, upload artifacts, then close out the task. Artifact
-  // upload still works while the run JWT is alive; complete/fail revokes it,
-  // so do uploads first.
   monitor.stop();
-  await finalize();
+  await finalize("normal_exit");
 
   if (runError) {
+    logT("error", "runner: calling client.fail", runError);
     try {
       await client.fail({ code: runError.code, message: runError.message });
-    } catch {
-      /* swallow */
+    } catch (e) {
+      logT("error", "runner: fail call threw", { err: (e as Error).message });
     }
+    logT("info", "runner: exiting 1");
     process.exit(1);
   } else {
+    logT("info", "runner: calling client.complete");
     try {
       await client.complete(runResult ?? { ok: true });
-    } catch {
-      /* swallow */
+      logT("info", "runner: complete acknowledged; exiting 0");
+    } catch (e) {
+      logT("error", "runner: complete call threw", { err: (e as Error).message });
     }
   }
 }

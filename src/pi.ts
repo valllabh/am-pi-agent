@@ -22,6 +22,7 @@ export interface RunPiArgs {
   payload: Record<string, unknown>;
   workdir?: string;
   monitor?: Monitor;
+  log?: (level: string, message: string, extras?: Record<string, unknown>) => void;
 }
 
 export interface RunPiResult {
@@ -55,7 +56,10 @@ function piProviderFor(model: string): string | null {
 }
 
 export async function runPi(args: RunPiArgs): Promise<RunPiResult> {
-  const { client, bootstrap, prompt, payload, monitor } = args;
+  const { client, bootstrap, prompt, payload, monitor, log } = args;
+  const narrate = (level: string, message: string, extras?: Record<string, unknown>): void => {
+    if (log) log(level, message, extras);
+  };
   const workdir = args.workdir ?? "/work";
 
   const requestedModel =
@@ -140,6 +144,15 @@ export async function runPi(args: RunPiArgs): Promise<RunPiResult> {
   );
 
   monitor?.markActivity();
+  narrate("info", "pi: child spawned", {
+    provider: piProvider,
+    model: piModel,
+    pid: child.pid,
+    workdir,
+    awsRegion: env.AWS_REGION,
+    secretEnvKeys: Object.keys(bootstrap.secrets),
+    argv: ["-p", "--mode", "json", "--provider", piProvider, "--model", piModel, "--system-prompt", `<${prompt.length} chars>`, "go"],
+  });
   enqueue({
     ts: new Date().toISOString(),
     level: "info",
@@ -200,10 +213,21 @@ export async function runPi(args: RunPiArgs): Promise<RunPiResult> {
     enqueue({ ts: new Date().toISOString(), level: "error", message: line });
   });
 
+  // Periodic liveness narration while we wait on the child. Helps confirm
+  // the runner is alive even when pi has not emitted anything.
+  const liveTicker = setInterval(() => {
+    narrate("info", "pi: still waiting on child", {
+      pid: child.pid,
+      stdoutBytesSeen: lastAssistantText.length,
+      stderrLastLine: lastStderr.slice(0, 200),
+    });
+  }, 30_000);
+
   const exitCode: number = await new Promise((resolve, reject) => {
     child.on("error", reject);
     child.on("close", (code) => resolve(code ?? 1));
   });
+  clearInterval(liveTicker);
 
   if (flushTimer) {
     clearTimeout(flushTimer);
@@ -211,6 +235,11 @@ export async function runPi(args: RunPiArgs): Promise<RunPiResult> {
   }
   await flushing;
   await flush();
+  narrate("info", "pi: child closed", {
+    exitCode,
+    lastStderr: lastStderr.slice(0, 500),
+    assistantTextBytes: lastAssistantText.length,
+  });
 
   const tokens = { in: totalIn, out: totalOut, costUsd: totalCostUsd };
 
