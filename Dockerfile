@@ -2,14 +2,14 @@
 # pi-agent sandbox runner. Pattern adopted from web-exposure-detection.
 # Bedrock via IAM (no api key); pi-coding-agent drives the LLM.
 
-FROM node:20-bookworm-slim AS build
+FROM public.ecr.aws/docker/library/node:20-bookworm-slim AS build
 WORKDIR /app
 COPY package.json tsconfig.json ./
 RUN npm install --omit=dev=false
 COPY src ./src
 RUN npx tsc -b
 
-FROM debian:bookworm-slim AS runner
+FROM public.ecr.aws/docker/library/debian:bookworm-slim AS runner
 ARG PI_VERSION=0.73.1
 ENV DEBIAN_FRONTEND=noninteractive \
     NODE_ENV=production \
