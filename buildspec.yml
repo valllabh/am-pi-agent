@@ -17,7 +17,7 @@ phases:
     commands:
       - export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
       - export ECR_URI=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_REPO_NAME}
-      - export IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:0:12}
+      - export IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-12)
       - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_URI}
       - |
         if [ ! -f nuclei ]; then
