@@ -1,0 +1,35 @@
+version: 0.2
+
+# AWS CodeBuild buildspec: builds the pi-agent docker image and pushes it to
+# ECR. Triggered by a GitHub webhook on push to main (configured in the
+# agent-manager deploy/terraform module) or manually via `aws codebuild
+# start-build --project-name am-pi-agent`.
+
+env:
+  variables:
+    AWS_REGION: us-east-1
+    IMAGE_REPO_NAME: agent-manager/sandbox-pi
+  exported-variables:
+    - IMAGE_TAG
+
+phases:
+  pre_build:
+    commands:
+      - export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - export ECR_URI=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_REPO_NAME}
+      - export IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:0:12}
+      - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_URI}
+      - |
+        if [ ! -f nuclei ]; then
+          curl -fsSLo /tmp/nuclei.zip "https://github.com/projectdiscovery/nuclei/releases/download/v3.4.7/nuclei_3.4.7_linux_amd64.zip"
+          unzip -p /tmp/nuclei.zip nuclei > nuclei
+          chmod +x nuclei
+        fi
+  build:
+    commands:
+      - docker build -t ${ECR_URI}:${IMAGE_TAG} -t ${ECR_URI}:latest .
+  post_build:
+    commands:
+      - docker push ${ECR_URI}:${IMAGE_TAG}
+      - docker push ${ECR_URI}:latest
+      - echo "Pushed ${ECR_URI}:${IMAGE_TAG} and :latest"

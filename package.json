@@ -1,0 +1,16 @@
+{
+  "name": "am-pi-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "agent-manager sandbox runner using pi (Bedrock via IAM)",
+  "engines": { "node": ">=20.0.0" },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3"
+  }
+}
