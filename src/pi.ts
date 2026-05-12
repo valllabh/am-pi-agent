@@ -140,7 +140,11 @@ export async function runPi(args: RunPiArgs): Promise<RunPiResult> {
       prompt,
       "go",
     ],
-    { cwd: workdir, env },
+    // stdio: stdin closed (matches Go's exec.Command default that web-exposure
+    // uses). Leaving stdin as a "pipe" causes pi to block on stdin instead of
+    // reading the positional user message arg — that's the silent-pi bug we
+    // chased for hours.
+    { cwd: workdir, env, stdio: ["ignore", "pipe", "pipe"] },
   );
 
   monitor?.markActivity();
