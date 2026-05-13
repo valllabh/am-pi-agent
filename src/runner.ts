@@ -57,7 +57,24 @@ async function main(): Promise<void> {
   });
 
   const payload = bootstrap.task.payload as Record<string, unknown>;
-  const prompt = payload.prompt;
+  // Story 19-1e: soulMd is the canonical system prompt. payload.prompt is
+  // the legacy per-task instruction text; accepted for one release with a
+  // deprecation warning. The full prompt assembled below is:
+  //   <soulMd> + <skillsContext> + ["\n\n# Task\n\n" + <legacy payload.prompt>]
+  // Once the deprecation closes (19-1z), the "# Task" section disappears and
+  // task instructions live entirely in payload, consumed by the LLM via the
+  // tool layer instead of being injected here.
+  const systemPrompt =
+    typeof bootstrap.soulMd === "string" && bootstrap.soulMd.trim().length > 0
+      ? bootstrap.soulMd
+      : "";
+  let legacyTaskText = "";
+  if (typeof payload.prompt === "string" && (payload.prompt as string).length > 0) {
+    legacyTaskText = payload.prompt as string;
+    console.warn(
+      "[runner] story 19-1e fallback: reading payload.prompt as legacy task instructions (one release deprecation)",
+    );
+  }
   const workdir = "/work";
 
   const monitor = startMonitor({
@@ -126,7 +143,7 @@ async function main(): Promise<void> {
   }
 
   try {
-    if (typeof prompt === "string" && prompt.length > 0) {
+    if (systemPrompt.length > 0 || legacyTaskText.length > 0) {
       logT("info", "runner: loading skills");
       const skills = await client.loadSkills();
       logT("info", "runner: skills loaded", {
@@ -136,14 +153,18 @@ async function main(): Promise<void> {
       const stagedCount = await stageSkillAssets({ client, skills, workdir, log: logT });
       logT("info", "runner: skill assets staged", { count: stagedCount });
       const skillsContext = buildSkillsContext(skills);
-      fullPrompt = `${bootstrap.soulMd}${skillsContext}\n\n# Task\n\n${prompt}`.trimStart();
+      fullPrompt = (
+        systemPrompt +
+        skillsContext +
+        (legacyTaskText ? `\n\n# Task\n\n${legacyTaskText}` : "")
+      ).trimStart();
       logT("info", "runner: prompt assembled", {
         chars: fullPrompt.length,
         skillsContextChars: skillsContext.length,
-        userPromptChars: typeof prompt === "string" ? prompt.length : 0,
+        userPromptChars: legacyTaskText.length,
       });
       logT("info", "runner: dispatching to pi runtime", {
-        model: typeof payload.model === "string" ? payload.model : "(default)",
+        model: bootstrap.agent.model ?? "(payload fallback)",
       });
 
       const out = await runPi({

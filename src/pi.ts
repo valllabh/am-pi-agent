@@ -62,10 +62,19 @@ export async function runPi(args: RunPiArgs): Promise<RunPiResult> {
   };
   const workdir = args.workdir ?? "/work";
 
-  const requestedModel =
-    typeof payload.model === "string" && payload.model.length > 0
-      ? payload.model
-      : "amazon-bedrock/us.amazon.nova-pro-v1:0";
+  // Story 19-1e: precedence is agent.model > payload.model > hardcoded
+  // fallback; agent.model lands as the canonical source once the api rollout
+  // is complete (one release with the payload fallback for old callers).
+  let fellBackFromPayload = false;
+  let requestedModel: string;
+  if (typeof bootstrap.agent.model === "string" && bootstrap.agent.model.length > 0) {
+    requestedModel = bootstrap.agent.model;
+  } else if (typeof payload.model === "string" && payload.model.length > 0) {
+    requestedModel = payload.model;
+    fellBackFromPayload = true;
+  } else {
+    requestedModel = "amazon-bedrock/us.amazon.nova-pro-v1:0";
+  }
 
   const piProvider = piProviderFor(requestedModel);
   if (!piProvider) {
@@ -83,8 +92,22 @@ export async function runPi(args: RunPiArgs): Promise<RunPiResult> {
 
   const env: NodeJS.ProcessEnv = { ...process.env };
   if (piProvider === "amazon-bedrock") {
-    env.AWS_REGION = env.AWS_REGION ?? env.AWS_DEFAULT_REGION ?? "us-east-1";
+    // Story 19-1e: region precedence is env.config.region > payload.region >
+    // existing AWS_REGION env > hardcoded us-east-1.
+    let resolvedRegion: string | undefined;
+    if (bootstrap.env && bootstrap.env.region) {
+      resolvedRegion = bootstrap.env.region;
+    } else if (typeof payload.region === "string" && payload.region.length > 0) {
+      resolvedRegion = payload.region;
+      fellBackFromPayload = true;
+    }
+    env.AWS_REGION = resolvedRegion ?? env.AWS_REGION ?? env.AWS_DEFAULT_REGION ?? "us-east-1";
     env.AWS_DEFAULT_REGION = env.AWS_REGION;
+  }
+  if (fellBackFromPayload) {
+    console.warn(
+      "[pi] story 19-1e fallback: agent.model or env.region missing; reading payload.* (one release deprecation)",
+    );
   }
   for (const [k, v] of Object.entries(bootstrap.secrets)) {
     env[k] = v;
