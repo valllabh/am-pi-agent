@@ -56,25 +56,17 @@ function piProviderFor(model: string): string | null {
 }
 
 export async function runPi(args: RunPiArgs): Promise<RunPiResult> {
-  const { client, bootstrap, prompt, payload, monitor, log } = args;
+  const { client, bootstrap, prompt, monitor, log } = args;
   const narrate = (level: string, message: string, extras?: Record<string, unknown>): void => {
     if (log) log(level, message, extras);
   };
   const workdir = args.workdir ?? "/work";
 
-  // Story 19-1e: precedence is agent.model > payload.model > hardcoded
-  // fallback; agent.model lands as the canonical source once the api rollout
-  // is complete (one release with the payload fallback for old callers).
-  let fellBackFromPayload = false;
-  let requestedModel: string;
-  if (typeof bootstrap.agent.model === "string" && bootstrap.agent.model.length > 0) {
-    requestedModel = bootstrap.agent.model;
-  } else if (typeof payload.model === "string" && payload.model.length > 0) {
-    requestedModel = payload.model;
-    fellBackFromPayload = true;
-  } else {
-    requestedModel = "amazon-bedrock/us.amazon.nova-pro-v1:0";
+  // Story 19-1z: agent.model is the only source. payload.model fallback is gone.
+  if (!(typeof bootstrap.agent.model === "string" && bootstrap.agent.model.length > 0)) {
+    throw new Error("agent.model missing from bootstrap; required after story 19-1z");
   }
+  const requestedModel: string = bootstrap.agent.model;
 
   const piProvider = piProviderFor(requestedModel);
   if (!piProvider) {
@@ -92,22 +84,12 @@ export async function runPi(args: RunPiArgs): Promise<RunPiResult> {
 
   const env: NodeJS.ProcessEnv = { ...process.env };
   if (piProvider === "amazon-bedrock") {
-    // Story 19-1e: region precedence is env.config.region > payload.region >
-    // existing AWS_REGION env > hardcoded us-east-1.
-    let resolvedRegion: string | undefined;
-    if (bootstrap.env && bootstrap.env.region) {
-      resolvedRegion = bootstrap.env.region;
-    } else if (typeof payload.region === "string" && payload.region.length > 0) {
-      resolvedRegion = payload.region;
-      fellBackFromPayload = true;
+    // Story 19-1z: env.config.region is the only source.
+    if (!(bootstrap.env && bootstrap.env.region)) {
+      throw new Error("env.region missing from bootstrap; required after story 19-1z");
     }
-    env.AWS_REGION = resolvedRegion ?? env.AWS_REGION ?? env.AWS_DEFAULT_REGION ?? "us-east-1";
+    env.AWS_REGION = bootstrap.env.region;
     env.AWS_DEFAULT_REGION = env.AWS_REGION;
-  }
-  if (fellBackFromPayload) {
-    console.warn(
-      "[pi] story 19-1e fallback: agent.model or env.region missing; reading payload.* (one release deprecation)",
-    );
   }
   for (const [k, v] of Object.entries(bootstrap.secrets)) {
     env[k] = v;
